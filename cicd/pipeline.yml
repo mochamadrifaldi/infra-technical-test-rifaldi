@@ -1,0 +1,167 @@
+name: Node.js Containerized App CI/CD
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Shared job: lint + test, runs on both branches
+  # ---------------------------------------------------------------------
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run test suite
+        run: npm test -- --ci
+
+      - name: Notify on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "❌ Lint/Test failed on branch `${{ github.ref_name }}` — commit ${{ github.sha }} by ${{ github.actor }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ---------------------------------------------------------------------
+  # Branch dev: build image tag short-sha, rolling deploy ke Development
+  # ---------------------------------------------------------------------
+  deploy-dev:
+    if: github.ref == 'refs/heads/dev'
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set short SHA
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Login to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push image (dev)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.sha_short }}
+
+      - name: Rolling deploy to Development Cluster
+        run: |
+          kubectl config use-context development-cluster
+          kubectl set image deployment/app app=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.sha_short }} -n development
+          kubectl rollout status deployment/app -n development --timeout=120s
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "❌ Deployment to Development Cluster failed — commit ${{ steps.vars.outputs.sha_short }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ---------------------------------------------------------------------
+  # Branch main: build production image, manual approval gate, deploy prod
+  # ---------------------------------------------------------------------
+  build-prod:
+    if: github.ref == 'refs/heads/main'
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    outputs:
+      sha_short: ${{ steps.vars.outputs.sha_short }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set short SHA
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Login to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push production image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.sha_short }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+  # The "production-approval" environment is configured under Settings > Environments
+  # with "Required reviewers" enabled — this job pauses until a reviewer approves it.
+  approval-gate:
+    if: github.ref == 'refs/heads/main'
+    needs: build-prod
+    runs-on: ubuntu-latest
+    environment:
+      name: production-approval
+    steps:
+      - name: Awaiting manual approval
+        run: echo "Waiting for reviewer approval before proceeding to Production deployment."
+
+  deploy-prod:
+    if: github.ref == 'refs/heads/main'
+    needs: [build-prod, approval-gate]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to Production
+        run: |
+          kubectl config use-context production-cluster
+          kubectl set image deployment/app app=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-prod.outputs.sha_short }} -n production
+          kubectl rollout status deployment/app -n production --timeout=180s
+
+      - name: Notify Slack on success
+        if: success()
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "✅ Production deploy succeeded — commit ${{ needs.build-prod.outputs.sha_short }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "🚨 Production deploy FAILED — commit ${{ needs.build-prod.outputs.sha_short }}, needs immediate attention!"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
